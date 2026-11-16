@@ -1,3 +1,15 @@
+# PX4 DYNAMIXEL 机械臂串口适配
+
+本仓库在 PX4 官方 `release/1.18` 分支基础上，为 **CUAV 7-Nano** 新增 `dxl_arm` 驱动，通过 **TELEM1 串口控制 ID 1、2、3 三台 DYNAMIXEL 舵机**。当前已在作者的硬件台架上实现控制效果，供交流与复现。
+
+- **已实现**：舵机在线检测、三台舵机同步目标位置写入、目标寄存器读回确认、当前位置读取；通过 PX4 的 NSH 控制台调用。
+- **主要改动**：新增 [`src/drivers/dxl_arm/`](src/drivers/dxl_arm/)，并在 [CUAV 7-Nano 板级配置](boards/cuav/7-nano/default.px4board)中启用驱动。协议处理包含 CRC16、字节填充、接收解析和串口写入错误处理。
+- **从这里开始**：阅读 [驱动说明：改动、配置与运行方法](src/drivers/dxl_arm/README.md)，或直接[查看相对官方基线的全部改动](https://github.com/supsmwhite/PX4-Dynamixel-Arm/compare/8303efda43...dxl-arm)。
+
+下面保留 PX4 官方项目介绍；本项目的操作说明以上方链接为准。
+
+---
+
 <p align="center">
   <a href="https://px4.io">
     <img src="docs/assets/site/px4_logo.svg" alt="PX4 Autopilot" width="240">
