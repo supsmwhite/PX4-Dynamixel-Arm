@@ -23,6 +23,7 @@ struct DxlStatusPacket {
 	uint8_t error;
 	uint8_t params[32];
 	size_t param_len;
+	hrt_abstime received_at;
 };
 
 // Dynamixel Protocol 2.0 标准 CRC16 (多项式 0x8005)
@@ -227,10 +228,10 @@ static int dxl_build_packet(uint8_t id, uint8_t inst, const uint8_t *params, siz
 
 // 按报文 Length 字段取完整帧 -> 校验 CRC16 -> 去除 FF FF FD FD 字节填充
 static int dxl_parse_frames(const uint8_t *rx, size_t rx_len, DxlStatusPacket *out_pkts,
-			    int max_pkts, bool resync_incomplete)
+			    int max_pkts, bool resync_incomplete, size_t &offset, int count,
+			    hrt_abstime received_at, uint8_t timed_width)
 {
-	int count = 0;
-	size_t i = 0;
+	size_t &i = offset;
 
 	while (i + 7 <= rx_len && count < max_pkts) {
 		if (rx[i] != 0xFF || rx[i + 1] != 0xFF || rx[i + 2] != 0xFD || rx[i + 3] != 0x00) {
@@ -293,7 +294,19 @@ static int dxl_parse_frames(const uint8_t *rx, size_t rx_len, DxlStatusPacket *o
 			if (unstuffed_len >= 2 && unstuffed[0] == 0x55) {
 				size_t p_len = unstuffed_len - 2;
 
-				if (p_len <= sizeof(out_pkts[count].params)) {
+				bool wanted = true;
+
+				if (timed_width != 0) {
+					// 计时每个 ID 只认第一份应答；错误应答仍保留，交给调用方报告。
+					wanted = pkt_id >= 1 && pkt_id <= 3 && (p_len == timed_width || unstuffed[1] != 0);
+
+					for (int j = 0; j < count && wanted; ++j) {
+						wanted = out_pkts[j].id != pkt_id;
+					}
+				}
+
+				if (wanted && p_len <= sizeof(out_pkts[count].params)) {
+					out_pkts[count].received_at = received_at;
 					out_pkts[count].id = pkt_id;
 					out_pkts[count].error = unstuffed[1];
 					out_pkts[count].param_len = p_len;
@@ -316,9 +329,17 @@ static int dxl_parse_frames(const uint8_t *rx, size_t rx_len, DxlStatusPacket *o
 
 // 发送请求帧并读取解析指定数量的 Status Packet (收齐即提前返回)
 static int dxl_exchange_status(int fd, const uint8_t *tx_buf, size_t tx_len,
-			       DxlStatusPacket *out_pkts, int expected_pkts, int timeout_ms, size_t *out_raw_bytes)
+			       DxlStatusPacket *out_pkts, int expected_pkts, int timeout_ms, size_t *out_raw_bytes,
+			       uint8_t timed_width = 0, hrt_abstime *submitted_at = nullptr)
 {
-	tcflush(fd, TCIFLUSH);
+	// Timing queries keep RX intact when queued directly behind a broadcast write.
+	if (timed_width == 0) {
+		tcflush(fd, TCIFLUSH);
+	}
+
+	if (submitted_at != nullptr) {
+		*submitted_at = hrt_absolute_time();
+	}
 
 	if (!dxl_write_all(fd, tx_buf, tx_len, timeout_ms)) {
 		return -1;
@@ -326,6 +347,9 @@ static int dxl_exchange_status(int fd, const uint8_t *tx_buf, size_t tx_len,
 
 	uint8_t rx_buf[256]{};
 	size_t total_rx = 0;
+	size_t offset = 0;
+	int got = 0;
+	hrt_abstime received_at = 0;
 	struct pollfd fds[1] = {{ .fd = fd, .events = POLLIN, .revents = 0 }};
 	hrt_abstime start_time = hrt_absolute_time();
 	uint64_t timeout_us = (uint64_t)timeout_ms * 1000ULL;
@@ -363,7 +387,19 @@ static int dxl_exchange_status(int fd, const uint8_t *tx_buf, size_t tx_len,
 
 			if (n > 0) {
 				total_rx += (size_t)n;
-				int got = dxl_parse_frames(rx_buf, total_rx, out_pkts, expected_pkts, false);
+
+				if (timed_width != 0) {
+					// 时间戳属于补齐帧的这次 read()；同次读出的多帧可能同戳。
+					received_at = hrt_absolute_time();
+
+				} else {
+					// Keep the existing full-buffer parse for normal commands.
+					offset = 0;
+					got = 0;
+				}
+
+				got = dxl_parse_frames(rx_buf, total_rx, out_pkts, expected_pkts, false, offset, got,
+						       received_at, timed_width);
 
 				if (got >= expected_pkts) {
 					if (out_raw_bytes != nullptr) {
@@ -384,11 +420,16 @@ static int dxl_exchange_status(int fd, const uint8_t *tx_buf, size_t tx_len,
 		*out_raw_bytes = total_rx;
 	}
 
-	return dxl_parse_frames(rx_buf, total_rx, out_pkts, expected_pkts, true);
+	if (timed_width == 0) {
+		offset = 0;
+		got = 0;
+	}
+
+	return dxl_parse_frames(rx_buf, total_rx, out_pkts, expected_pkts, true, offset, got, received_at, timed_width);
 }
 
 static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t out_errs[3], size_t *out_raw_bytes,
-			  uint8_t width = 4)
+			  uint8_t width = 4, hrt_abstime *out_received_at = nullptr, hrt_abstime *submitted_at = nullptr)
 {
 	uint8_t sr_params[7] = {
 		(uint8_t)(addr & 0xFF), (uint8_t)((addr >> 8) & 0xFF),
@@ -403,7 +444,8 @@ static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t ou
 	}
 
 	DxlStatusPacket pkts[3]{};
-	int got = dxl_exchange_status(fd, tx, (size_t)tx_len, pkts, 3, 60, out_raw_bytes);
+	int got = dxl_exchange_status(fd, tx, (size_t)tx_len, pkts, 3, 60, out_raw_bytes,
+				      out_received_at != nullptr ? width : 0, submitted_at);
 
 	if (got < 0) {
 		return false;
@@ -414,7 +456,8 @@ static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t ou
 	for (int idx = 0; idx < got; idx++) {
 		uint8_t id = pkts[idx].id;
 
-		if (id >= 1 && id <= 3 && pkts[idx].param_len == width) {
+		if (id >= 1 && id <= 3 && (pkts[idx].param_len == width ||
+					   (out_received_at != nullptr && pkts[idx].error != 0))) {
 			uint32_t raw = 0;
 
 			for (unsigned byte = 0; byte < width; ++byte) {
@@ -423,6 +466,11 @@ static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t ou
 
 			out_vals[id - 1] = (int32_t)raw;
 			out_errs[id - 1] = pkts[idx].error;
+
+			if (out_received_at != nullptr) {
+				out_received_at[id - 1] = pkts[idx].received_at;
+			}
+
 			seen[id - 1] = true;
 		}
 	}
@@ -430,7 +478,7 @@ static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t ou
 	return seen[0] && seen[1] && seen[2];
 }
 
-static bool dxl_sync_write_goal(int fd, const int32_t pos[3])
+static bool dxl_sync_write_goal(int fd, const int32_t pos[3], hrt_abstime *submitted_at = nullptr)
 {
 	uint8_t params[19] = {116, 0, 4, 0};
 
@@ -444,7 +492,16 @@ static bool dxl_sync_write_goal(int fd, const int32_t pos[3])
 
 	uint8_t tx[48]{};
 	const int len = dxl_build_packet(0xFE, 0x83, params, sizeof(params), tx, sizeof(tx));
-	return len > 0 && dxl_write_all(fd, tx, static_cast<size_t>(len), 50);
+
+	if (len <= 0) {
+		return false;
+	}
+
+	if (submitted_at != nullptr) {
+		*submitted_at = hrt_absolute_time();
+	}
+
+	return dxl_write_all(fd, tx, static_cast<size_t>(len), 50);
 }
 
 using dxl_rc::ScPosition;
@@ -627,7 +684,7 @@ static int dxl_rc_control(bool automatic)
 	constexpr hrt_abstime write_interval_us = 50000;
 	constexpr hrt_abstime verify_interval_us = 500000;
 	constexpr hrt_abstime center_feedback_us = 100000;
-	constexpr int32_t max_step = 18;
+	constexpr int32_t wave_max_step = 18;
 	constexpr int32_t center_tolerance = 15;
 	uORB::Subscription rc_sub{ORB_ID(input_rc)};
 	uORB::Subscription armed_sub{ORB_ID(actuator_armed)};
@@ -758,6 +815,7 @@ static int dxl_rc_control(bool automatic)
 			continue;
 		}
 
+		// 目标写入不等于已经回中；实际位置连续两次达标才放行外档。
 		if (mode == ScPosition::Center && goals[0] == dxl_rc::level_goal && goals[1] == dxl_rc::level_goal
 		    && goals[2] == dxl_rc::level_goal && now - last_center >= center_feedback_us) {
 			int32_t actual[3]{};
@@ -792,8 +850,11 @@ static int dxl_rc_control(bool automatic)
 			int32_t next_goals[3]{};
 			bool changed = false;
 
+			// 上、中档交给舵机执行最终位置；只有下档正弦轨迹保留软件步进限制。
 			for (unsigned i = 0; i < 3; ++i) {
-				next_goals[i] = goals[i] + math::constrain(demand - goals[i], -max_step, max_step);
+				next_goals[i] = mode == ScPosition::Down
+						? goals[i] + math::constrain(demand - goals[i], -wave_max_step, wave_max_step)
+						: demand;
 				changed |= next_goals[i] != goals[i];
 			}
 
@@ -820,6 +881,219 @@ static int dxl_auto_task(int, char *[])
 	auto_running.store(false);
 	serial_busy.store(false);
 	return result;
+}
+
+static constexpr int32_t timing_tolerance = 15;
+
+static bool dxl_timing_precheck(int fd, const int32_t target[3])
+{
+	int32_t mode[3]{}, torque[3]{}, lower[3]{}, upper[3]{}, old_goals[3]{}, actual[3]{};
+
+	if (!dxl_read_checked(fd, 11, mode, 1) || !dxl_read_checked(fd, 64, torque, 1)
+	    || !dxl_read_checked(fd, 52, lower) || !dxl_read_checked(fd, 48, upper)
+	    || !dxl_read_checked(fd, 116, old_goals) || !dxl_read_checked(fd, 132, actual)) {
+		return false;
+	}
+
+	for (unsigned i = 0; i < 3; ++i) {
+		if (mode[i] != 3 || torque[i] != 1 || target[i] < lower[i] || target[i] > upper[i]
+		    || actual[i] < lower[i] || actual[i] > upper[i] || old_goals[i] < lower[i] || old_goals[i] > upper[i]) {
+			PX4_ERR("Timing ID %u: check position mode, torque and limits", i + 1);
+			return false;
+		}
+
+		if (old_goals[i] == target[i] || labs(static_cast<long>(actual[i]) - old_goals[i]) > timing_tolerance
+		    || labs(static_cast<long>(actual[i]) - target[i]) <= timing_tolerance) {
+			PX4_ERR("Timing ID %u: first settle at a different goal", i + 1);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int dxl_move_timing(int fd, const int32_t target[3], uORB::Subscription &armed_sub)
+{
+	constexpr hrt_abstime goal_timeout_us = 300000;
+	constexpr hrt_abstime motion_timeout_us = 5000000;
+	constexpr hrt_abstime position_period_us = 10000;
+	hrt_abstime accepted[3]{};
+	hrt_abstime last_outside[3]{};
+	hrt_abstime first_inside[3]{};
+	hrt_abstime settled[3]{};
+	hrt_abstime t0 = 0;
+	unsigned goal_reads = 0;
+	unsigned position_reads = 0;
+	const char *failure = nullptr;
+	unsigned error_id = 0;
+	unsigned error_code = 0;
+
+	if (!dxl_bench_disarmed(armed_sub) || !dxl_timing_precheck(fd, target)) {
+		PX4_ERR("Timing precheck failed; no motion command sent");
+		return -1;
+	}
+
+	if (tcflush(fd, TCIFLUSH) != 0 || !dxl_bench_disarmed(armed_sub)) {
+		PX4_ERR("Timing: RX flush failed or vehicle not disarmed; no motion command sent");
+		return -1;
+	}
+
+	if (!dxl_sync_write_goal(fd, target, &t0)) {
+		PX4_ERR("Timing: goal write failed");
+		return -1;
+	}
+
+	// 只写一次目标；先查目标寄存器，再查实际位置，区分确认指令和到位。
+	uint16_t addr = 116;
+
+	while (true) {
+		const bool goal_phase = addr == 116;
+		const hrt_abstime deadline = goal_phase ? goal_timeout_us : motion_timeout_us;
+		const hrt_abstime query_started = hrt_absolute_time();
+
+		if (query_started - t0 >= deadline) {
+			failure = "confirmation deadline";
+			break;
+		}
+
+		if (!dxl_bench_disarmed(armed_sub)) {
+			failure = "not disarmed";
+			break;
+		}
+
+		int32_t values[3]{};
+		uint8_t errors[3]{};
+		hrt_abstime received[3]{};
+		const bool complete = dxl_sync_read(fd, addr, values, errors, nullptr, 4, received);
+		++(goal_phase ? goal_reads : position_reads);
+
+		for (unsigned i = 0; i < 3; ++i) {
+			if (received[i] == 0) {
+				continue;
+			}
+
+			if (errors[i] != 0) {
+				failure = "servo status error";
+				error_id = i + 1;
+				error_code = errors[i];
+				continue;
+			}
+
+			const hrt_abstime elapsed = received[i] - t0;
+
+			if (elapsed > deadline) {
+				failure = "confirmation deadline";
+				continue;
+			}
+
+			if (goal_phase) {
+				if (values[i] == target[i] && accepted[i] == 0) {
+					accepted[i] = elapsed;
+				}
+
+			} else {
+				const bool in_range = labs(static_cast<long>(values[i]) - target[i]) <= timing_tolerance;
+
+				// 离开容差后，之前的首次到位与连续两次确认都不再有效。
+				if (!in_range) {
+					last_outside[i] = elapsed;
+					first_inside[i] = 0;
+					settled[i] = 0;
+
+				} else if (first_inside[i] == 0) {
+					first_inside[i] = elapsed;
+
+				} else if (settled[i] == 0) {
+					settled[i] = elapsed;
+				}
+			}
+		}
+
+		if (failure != nullptr) {
+			break;
+		}
+
+		if (!complete) {
+			failure = "incomplete readback";
+			break;
+		}
+
+		if (goal_phase) {
+			if (accepted[0] != 0 && accepted[1] != 0 && accepted[2] != 0) {
+				addr = 132;
+			}
+
+			continue; // No artificial gap before the next query.
+		}
+
+		if (settled[0] != 0 && settled[1] != 0 && settled[2] != 0) {
+			break;
+		}
+
+		const hrt_abstime query_elapsed = hrt_elapsed_time(&query_started);
+
+		// 周期按每轮开始计；收齐已超过周期时直接发下一轮，不额外等待。
+		if (query_elapsed < position_period_us) {
+			px4_usleep(position_period_us - query_elapsed);
+		}
+	}
+
+	for (unsigned i = 0; i < 3; ++i) {
+		PX4_INFO("Timing ID %u: goal_us=%lu settled_us=%lu", i + 1, static_cast<unsigned long>(accepted[i]),
+			 static_cast<unsigned long>(settled[i]));
+		PX4_INFO("Timing ID %u: last_out_us=%lu first_in_us=%lu", i + 1,
+			 static_cast<unsigned long>(last_outside[i]), static_cast<unsigned long>(first_inside[i]));
+	}
+
+	PX4_INFO("Timing queries: goal=%u position=%u (0 us means unconfirmed)", goal_reads, position_reads);
+
+	if (failure != nullptr) {
+		PX4_ERR("Timing failed at reg %u: %s (ID %u, error 0x%02x)", static_cast<unsigned>(addr), failure,
+			error_id, error_code);
+		return -1;
+	}
+
+	PX4_INFO("Timing all 3: goal_us=%lu settled_us=%lu",
+		 static_cast<unsigned long>(math::max(accepted[0], math::max(accepted[1], accepted[2]))),
+		 static_cast<unsigned long>(math::max(settled[0], math::max(settled[1], settled[2]))));
+	return 0;
+}
+
+static int dxl_read_timing(int fd)
+{
+	int32_t positions[3]{};
+	uint8_t errors[3]{};
+	hrt_abstime received[3]{};
+	hrt_abstime submitted = 0;
+	hrt_abstime last_reply = 0;
+	// 单轮读位置，保留完整往返耗时；三台都有效时才报告整组耗时。
+	const bool complete = dxl_sync_read(fd, 132, positions, errors, nullptr, 4, received, &submitted);
+	bool valid = complete;
+
+	for (unsigned i = 0; i < 3; ++i) {
+		if (received[i] == 0) {
+			PX4_ERR("Read timing ID %u: no valid reply", i + 1);
+			valid = false;
+
+		} else if (errors[i] != 0) {
+			PX4_ERR("Read timing ID %u: servo error 0x%02x", i + 1, static_cast<unsigned>(errors[i]));
+			valid = false;
+
+		} else {
+			const hrt_abstime elapsed = received[i] - submitted;
+			last_reply = math::max(last_reply, elapsed);
+			PX4_INFO("Read timing ID %u: pos=%ld read_us=%lu", i + 1, static_cast<long>(positions[i]),
+				 static_cast<unsigned long>(elapsed));
+		}
+	}
+
+	if (!valid) {
+		PX4_ERR("Read timing failed: no complete valid position set");
+		return -1;
+	}
+
+	PX4_INFO("Read timing all 3: read_us=%lu", static_cast<unsigned long>(last_reply));
+	return 0;
 }
 
 static int dxl_serial_command(int argc, char *argv[])
@@ -864,16 +1138,24 @@ static int dxl_serial_command(int argc, char *argv[])
 		return all_ok ? 0 : -1;
 
 	} else if (strcmp(argv[1], "move") == 0) {
-		if (argc != 5) {
-			PX4_ERR("参数数量错误! 用法: dxl_arm move <pos1> <pos2> <pos3>");
+		const bool timing = argc > 2 && strcmp(argv[2], "--timing") == 0;
+		const int first_pos = timing ? 3 : 2;
+
+		if (argc != first_pos + 3) {
+			PX4_ERR("Usage: dxl_arm move [--timing] <p1> <p2> <p3>");
 			return -1;
 		}
 
 		int32_t pos[3]{};
 
 		for (int m = 0; m < 3; m++) {
-			if (!parse_goal_pos(argv[m + 2], &pos[m])) {
-				PX4_ERR("第 %d 个目标位置参数非法 (%s)! 请输入 0 ~ 4095 之间的整数", m + 1, argv[m + 2]);
+			if (!parse_goal_pos(argv[m + first_pos], &pos[m])) {
+				PX4_ERR("第 %d 个目标位置参数非法 (%s)! 请输入 0 ~ 4095 之间的整数", m + 1, argv[m + first_pos]);
+				return -1;
+			}
+
+			if (timing && (pos[m] < dxl_rc::wave_min || pos[m] > dxl_rc::raise_goal)) {
+				PX4_ERR("Timing target outside bench range: %ld", static_cast<long>(pos[m]));
 				return -1;
 			}
 		}
@@ -882,6 +1164,13 @@ static int dxl_serial_command(int argc, char *argv[])
 
 		if (fd < 0) {
 			return -1;
+		}
+
+		if (timing) {
+			uORB::Subscription armed_sub{ORB_ID(actuator_armed)};
+			const int result = dxl_move_timing(fd, pos, armed_sub);
+			::close(fd);
+			return result;
 		}
 
 		// 1. 广播开启 3 台电机力矩 (Addr 64 = 1)
@@ -926,10 +1215,23 @@ static int dxl_serial_command(int argc, char *argv[])
 		return 0;
 
 	} else if (strcmp(argv[1], "read") == 0) {
+		const bool timing = argc == 3 && strcmp(argv[2], "--timing") == 0;
+
+		if (argc != 2 && !timing) {
+			PX4_ERR("Usage: dxl_arm read [--timing]");
+			return -1;
+		}
+
 		int fd = dxl_open_port(dev, baud);
 
 		if (fd < 0) {
 			return -1;
+		}
+
+		if (timing) {
+			const int result = dxl_read_timing(fd);
+			::close(fd);
+			return result;
 		}
 
 		int32_t cur_pos[3]{};
@@ -958,7 +1260,8 @@ static int dxl_serial_command(int argc, char *argv[])
 extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 {
 	if (argc < 2) {
-		PX4_INFO("Usage: dxl_arm [start | stop | status | ping | move <p1> <p2> <p3> | read | rc_test | rc_live]");
+		PX4_INFO("Usage: dxl_arm [start | stop | status | ping | move | read | rc_test | rc_live]");
+		PX4_INFO("          read [--timing]; move [--timing] <p1> <p2> <p3>");
 		return -1;
 	}
 
