@@ -1,10 +1,11 @@
 # PX4 DYNAMIXEL 机械臂串口适配
 
-本仓库在 PX4 官方 `release/1.18` 分支基础上，为 **CUAV 7-Nano** 新增 `dxl_arm` 驱动，通过 **TELEM1 串口控制 ID 1、2、3 三台 DYNAMIXEL 舵机**。当前已在作者的硬件台架上实现控制效果，供交流与复现。
+本仓库基于 PX4 `release/1.18`，为 **CUAV 7-Nano** 增加 `dxl_arm` 驱动，通过 **TELEM1** 控制三台 **DYNAMIXEL XL430-W250-T**（ID 1、2、3）。串口控制和遥控三档动作均已在实机台架验证。
 
-- **已实现**：舵机在线检测、三台舵机同步目标位置写入、目标寄存器读回确认、当前位置读取；通过 PX4 的 NSH 控制台调用。
-- **主要改动**：新增 [`src/drivers/dxl_arm/`](src/drivers/dxl_arm/)，并在 [CUAV 7-Nano 板级配置](boards/cuav/7-nano/default.px4board)中启用驱动。协议处理包含 CRC16、字节填充、接收解析和串口写入错误处理。
-- **从这里开始**：阅读 [驱动说明：改动、配置与运行方法](src/drivers/dxl_arm/README.md)，或直接[查看相对官方基线的全部改动](https://github.com/supsmwhite/PX4-Dynamixel-Arm/compare/8303efda43...dxl-arm)。
+- **串口控制**：检测舵机在线、同步写入三台目标位置、读回目标和实际位置。
+- **遥控控制**：ELRS/CRSF 接收机通过 **TELEM2** 输入，`SC`（`CH7`）上档抬升到 `2800`，中档回到 `2000`，下档在 `1900～2500` 间正弦往复。飞控开机自动监听，正常使用无需 QGC 或控制台。
+- **台架保护**：仅在飞控未解锁时运行，三台舵机实际回中后才允许切入上、下档；遥控失联后不会从外档自动恢复动作。
+- **从这里开始**：[接线、编译与使用说明](src/drivers/dxl_arm/README.md) · [相对官方基线的全部改动](https://github.com/supsmwhite/PX4-Dynamixel-Arm/compare/8303efda43...dxl-arm)
 
 下面保留 PX4 官方项目介绍；本项目的操作说明以上方链接为准。
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Bench-only Dynamixel RC control. The task waits for a disarmed vehicle and center detent.
+
+dxl_arm start

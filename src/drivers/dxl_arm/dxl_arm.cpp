@@ -1,6 +1,10 @@
+#include "rc_motion.hpp"
+
+#include <px4_platform_common/atomic.h>
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/module.h>
+#include <px4_platform_common/tasks.h>
 #include <px4_platform_common/time.h>
 #include <drivers/drv_hrt.h>
 #include <errno.h>
@@ -10,6 +14,9 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#include <uORB/Subscription.hpp>
+#include <uORB/topics/actuator_armed.h>
+#include <uORB/topics/input_rc.h>
 
 struct DxlStatusPacket {
 	uint8_t id;
@@ -380,12 +387,12 @@ static int dxl_exchange_status(int fd, const uint8_t *tx_buf, size_t tx_len,
 	return dxl_parse_frames(rx_buf, total_rx, out_pkts, expected_pkts, true);
 }
 
-// 同步读取 ID 1, 2, 3 的 4 字节整型寄存器 (用于读当前位置 Addr 132 或读回校验目标位置 Addr 116)
-static bool dxl_sync_read_i32(int fd, uint16_t addr, int32_t out_vals[3], uint8_t out_errs[3], size_t *out_raw_bytes)
+static bool dxl_sync_read(int fd, uint16_t addr, int32_t out_vals[3], uint8_t out_errs[3], size_t *out_raw_bytes,
+			  uint8_t width = 4)
 {
 	uint8_t sr_params[7] = {
 		(uint8_t)(addr & 0xFF), (uint8_t)((addr >> 8) & 0xFF),
-		0x04, 0x00,
+		width, 0x00,
 		1, 2, 3
 	};
 	uint8_t tx[32]{};
@@ -407,11 +414,13 @@ static bool dxl_sync_read_i32(int fd, uint16_t addr, int32_t out_vals[3], uint8_
 	for (int idx = 0; idx < got; idx++) {
 		uint8_t id = pkts[idx].id;
 
-		if (id >= 1 && id <= 3 && pkts[idx].param_len == 4) {
-			uint32_t raw = (uint32_t)pkts[idx].params[0] |
-				       ((uint32_t)pkts[idx].params[1] << 8) |
-				       ((uint32_t)pkts[idx].params[2] << 16) |
-				       ((uint32_t)pkts[idx].params[3] << 24);
+		if (id >= 1 && id <= 3 && pkts[idx].param_len == width) {
+			uint32_t raw = 0;
+
+			for (unsigned byte = 0; byte < width; ++byte) {
+				raw |= static_cast<uint32_t>(pkts[idx].params[byte]) << (8 * byte);
+			}
+
 			out_vals[id - 1] = (int32_t)raw;
 			out_errs[id - 1] = pkts[idx].error;
 			seen[id - 1] = true;
@@ -421,14 +430,405 @@ static bool dxl_sync_read_i32(int fd, uint16_t addr, int32_t out_vals[3], uint8_
 	return seen[0] && seen[1] && seen[2];
 }
 
-extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
+static bool dxl_sync_write_goal(int fd, const int32_t pos[3])
 {
-	const char *dev = "/dev/ttyS5"; // TELEM1
-	int baud = 57600;
+	uint8_t params[19] = {116, 0, 4, 0};
 
-	if (argc < 2) {
-		PX4_INFO("用法: dxl_arm [ping | move <pos1> <pos2> <pos3> | read]");
-		return -1;
+	for (unsigned i = 0; i < 3; ++i) {
+		params[4 + 5 * i] = static_cast<uint8_t>(i + 1);
+
+		for (unsigned byte = 0; byte < 4; ++byte) {
+			params[5 + 5 * i + byte] = static_cast<uint8_t>(static_cast<uint32_t>(pos[i]) >> (8 * byte));
+		}
+	}
+
+	uint8_t tx[48]{};
+	const int len = dxl_build_packet(0xFE, 0x83, params, sizeof(params), tx, sizeof(tx));
+	return len > 0 && dxl_write_all(fd, tx, static_cast<size_t>(len), 50);
+}
+
+using dxl_rc::ScPosition;
+
+static constexpr const char *dxl_device = "/dev/ttyS5"; // TELEM1
+static constexpr int dxl_baud = 57600;
+static constexpr unsigned ch7_index = 6;
+static constexpr hrt_abstime rc_timeout_us = 250000;
+static px4::atomic<bool> serial_busy{false};
+static px4::atomic<bool> auto_running{false};
+static px4::atomic<bool> auto_stop{false};
+
+static bool dxl_read_checked(int fd, uint16_t addr, int32_t values[3], uint8_t width = 4)
+{
+	uint8_t errors[3]{};
+
+	if (!dxl_sync_read(fd, addr, values, errors, nullptr, width)) {
+		PX4_ERR("Readback timeout at reg %u", static_cast<unsigned>(addr));
+		return false;
+	}
+
+	for (unsigned i = 0; i < 3; ++i) {
+		if (errors[i] != 0) {
+			PX4_ERR("ID %u reg %u: error 0x%02x", i + 1, static_cast<unsigned>(addr), static_cast<unsigned>(errors[i]));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static bool dxl_verify_goals(int fd, const int32_t expected[3])
+{
+	int32_t values[3]{};
+	return dxl_read_checked(fd, 116, values) && values[0] == expected[0]
+	       && values[1] == expected[1] && values[2] == expected[2];
+}
+
+static bool dxl_enable_torque(int fd)
+{
+	const uint8_t params[] = {64, 0, 1};
+	uint8_t tx[24]{};
+	const int len = dxl_build_packet(0xFE, 0x03, params, sizeof(params), tx, sizeof(tx));
+	return len > 0 && dxl_write_all(fd, tx, static_cast<size_t>(len), 50);
+}
+
+static bool dxl_bench_disarmed(uORB::Subscription &armed_sub)
+{
+	actuator_armed_s state{};
+	return armed_sub.copy(&state) && state.timestamp != 0 && hrt_elapsed_time(&state.timestamp) < 1000000
+	       && !state.armed && !state.kill && !state.lockdown && !state.termination && !state.in_esc_calibration_mode;
+}
+
+static bool dxl_rc_valid(const input_rc_s &rc, hrt_abstime now)
+{
+	return rc.timestamp_last_signal != 0 && rc.timestamp_last_signal <= now
+	       && now - rc.timestamp_last_signal < rc_timeout_us
+	       && rc.input_source == input_rc_s::RC_INPUT_SOURCE_PX4FMU_CRSF
+	       && rc.channel_count > ch7_index && !rc.rc_lost && !rc.rc_failsafe;
+}
+
+static ScPosition sc_position(uint16_t value)
+{
+	// Accept only values near the three measured detents.
+	if (abs(static_cast<int>(value) - 2000) <= 100) {
+		return ScPosition::Up;
+	}
+
+	if (abs(static_cast<int>(value) - 1503) <= 100) {
+		return ScPosition::Center;
+	}
+
+	if (abs(static_cast<int>(value) - 999) <= 100) {
+		return ScPosition::Down;
+	}
+
+	return ScPosition::Unknown;
+}
+
+static int dxl_rc_test()
+{
+	constexpr hrt_abstime stable_time_us = 150000;
+	constexpr hrt_abstime test_duration_us = 60000000;
+	uORB::Subscription rc_sub{ORB_ID(input_rc)};
+	input_rc_s rc{};
+	ScPosition pending = ScPosition::Unknown;
+	ScPosition reported = ScPosition::Unknown;
+	hrt_abstime pending_since = 0;
+	bool link_valid = false;
+	const hrt_abstime start = hrt_absolute_time();
+	PX4_INFO("SC/CH7 test: 60 s, no servo output. Start in CENTER.");
+
+	while (hrt_elapsed_time(&start) < test_duration_us) {
+		const bool updated = rc_sub.update(&rc);
+		const hrt_abstime sample = rc.timestamp_last_signal;
+
+		if (!dxl_rc_valid(rc, hrt_absolute_time())) {
+			if (link_valid) {
+				PX4_WARN("CH7 signal invalid. Return SC to CENTER after reconnecting.");
+			}
+
+			link_valid = false;
+			pending = reported = ScPosition::Unknown;
+
+		} else if (updated) {
+			if (!link_valid) {
+				PX4_INFO("CRSF detected. Hold SC in CENTER to begin.");
+				link_valid = true;
+			}
+
+			const uint16_t value = rc.values[ch7_index];
+			const ScPosition position = sc_position(value);
+
+			if (position != pending || sample < pending_since) {
+				pending = position;
+				pending_since = sample;
+
+			} else if (position != ScPosition::Unknown && position != reported && sample - pending_since >= stable_time_us
+				   && (reported != ScPosition::Unknown || position == ScPosition::Center)) {
+				reported = position;
+				const char *action = position == ScPosition::Up ? "UP / raise"
+						     : position == ScPosition::Down ? "DOWN / oscillate" : "CENTER / level";
+				PX4_INFO("CH7 %u: %s", static_cast<unsigned>(value), action);
+			}
+		}
+
+		px4_usleep(20000);
+	}
+
+	PX4_INFO("CH7 test finished.");
+	return 0;
+}
+
+static bool dxl_center_requested(uORB::Subscription &rc_sub, uORB::Subscription &armed_sub, bool automatic)
+{
+	input_rc_s rc{};
+	return (!automatic || !auto_stop.load()) && dxl_bench_disarmed(armed_sub) && rc_sub.copy(&rc)
+	       && dxl_rc_valid(rc, hrt_absolute_time()) && sc_position(rc.values[ch7_index]) == ScPosition::Center;
+}
+
+static bool dxl_prepare_center(int fd, int32_t goals[3], uORB::Subscription &rc_sub,
+			       uORB::Subscription &armed_sub, bool automatic)
+{
+	constexpr int32_t safe_min = 1800;
+	constexpr int32_t safe_max = 3000;
+	int32_t mode[3]{}, upper[3]{}, lower[3]{}, torque[3]{};
+
+	if (!dxl_read_checked(fd, 11, mode, 1) || !dxl_read_checked(fd, 48, upper)
+	    || !dxl_read_checked(fd, 52, lower) || !dxl_read_checked(fd, 64, torque, 1)
+	    || !dxl_read_checked(fd, 132, goals)) {
+		return false;
+	}
+
+	bool needs_torque = false;
+
+	for (unsigned i = 0; i < 3; ++i) {
+		if (mode[i] != 3 || lower[i] > dxl_rc::wave_min || upper[i] < dxl_rc::raise_goal
+		    || goals[i] < math::max(safe_min, lower[i]) || goals[i] > math::min(safe_max, upper[i])
+		    || (torque[i] != 0 && torque[i] != 1)) {
+			PX4_ERR("ID %u: check position mode, limits and starting position", i + 1);
+			return false;
+		}
+
+		needs_torque |= torque[i] == 0;
+	}
+
+	// Seed the goal with the measured position before enabling torque.
+	if (!dxl_center_requested(rc_sub, armed_sub, automatic) || !dxl_sync_write_goal(fd, goals)
+	    || !dxl_verify_goals(fd, goals)) {
+		return false;
+	}
+
+	return !needs_torque || (dxl_center_requested(rc_sub, armed_sub, automatic) && dxl_enable_torque(fd)
+				&& dxl_read_checked(fd, 64, torque, 1) && torque[0] == 1 && torque[1] == 1 && torque[2] == 1);
+}
+
+static int dxl_rc_control(bool automatic)
+{
+	constexpr hrt_abstime settle_detent_us = 150000;
+	constexpr hrt_abstime write_interval_us = 50000;
+	constexpr hrt_abstime verify_interval_us = 500000;
+	constexpr hrt_abstime center_feedback_us = 100000;
+	constexpr int32_t max_step = 18;
+	constexpr int32_t center_tolerance = 15;
+	uORB::Subscription rc_sub{ORB_ID(input_rc)};
+	uORB::Subscription armed_sub{ORB_ID(actuator_armed)};
+	input_rc_s rc{};
+	dxl_rc::CenterGate gate;
+	ScPosition mode = ScPosition::Unknown;
+	ScPosition pending = ScPosition::Unknown;
+	hrt_abstime pending_since = 0;
+	bool stable = false;
+	bool bus_fault = false;
+	bool verify_torque = false;
+	unsigned center_samples = 0;
+	int fd = -1;
+	int32_t goals[3]{};
+	const hrt_abstime start = hrt_absolute_time();
+	hrt_abstime last_write = start;
+	hrt_abstime last_verify = start;
+	hrt_abstime last_center = 0;
+	hrt_abstime wave_start = 0;
+	int result = 0;
+
+	const auto reset = [&]() {
+		if (fd >= 0) {
+			::close(fd);
+			fd = -1;
+		}
+
+		gate.reset();
+		mode = pending = ScPosition::Unknown;
+		stable = false;
+		center_samples = 0;
+	};
+
+	const auto fault = [&]() {
+		PX4_ERR("Dynamixel paused. Check bus, then leave and return to CENTER.");
+		reset();
+		bus_fault = true;
+	};
+
+	PX4_INFO("Dynamixel %s: disarmed only. Hold SC in CENTER until ready.", automatic ? "RC auto" : "RC live (60 s)");
+
+	while (automatic ? !auto_stop.load() : hrt_elapsed_time(&start) < 60000000) {
+		px4_usleep(10000);
+		const bool updated = rc_sub.update(&rc);
+		const bool disarmed = dxl_bench_disarmed(armed_sub);
+		const hrt_abstime now = hrt_absolute_time();
+
+		if (!disarmed || !dxl_rc_valid(rc, now)) {
+			if (fd >= 0 || mode != ScPosition::Unknown) {
+				PX4_WARN("RC link or disarmed state lost. Return to CENTER to resume.");
+
+				if (!automatic) {
+					result = -1;
+					break;
+				}
+			}
+
+			reset();
+			continue;
+		}
+
+		const ScPosition raw = sc_position(rc.values[ch7_index]);
+
+		if (updated) {
+			const hrt_abstime sample = rc.timestamp_last_signal;
+
+			if (raw != pending || sample < pending_since) {
+				pending = raw;
+				pending_since = sample;
+			}
+
+			stable = sample - pending_since >= settle_detent_us;
+		}
+
+		if (bus_fault) {
+			if (stable && (raw == ScPosition::Up || raw == ScPosition::Down)) {
+				bus_fault = false;
+			}
+
+			continue;
+		}
+
+		const ScPosition next = gate.update(raw, stable);
+
+		if (mode != next) {
+			mode = next;
+			center_samples = 0;
+			last_center = 0;
+			wave_start = now;
+
+			if (mode != ScPosition::Unknown) {
+				PX4_INFO("SC: %s", mode == ScPosition::Center ? "CENTER / leveling" :
+					 mode == ScPosition::Up ? "UP / raise" : "DOWN / oscillate");
+			}
+		}
+
+		if (mode == ScPosition::Unknown || mode != raw) {
+			continue;
+		}
+
+		if (fd < 0) {
+			fd = dxl_open_port(dxl_device, dxl_baud);
+
+			if (fd < 0 || !dxl_prepare_center(fd, goals, rc_sub, armed_sub, automatic)) {
+				if (!dxl_center_requested(rc_sub, armed_sub, automatic)) {
+					reset();
+
+				} else {
+					fault();
+				}
+			}
+
+			last_write = last_verify = hrt_absolute_time();
+			continue;
+		}
+
+		if (now - last_verify >= verify_interval_us) {
+			int32_t torque[3]{};
+			const bool ok = verify_torque ? dxl_read_checked(fd, 64, torque, 1)
+					&& torque[0] == 1 && torque[1] == 1 && torque[2] == 1 : dxl_verify_goals(fd, goals);
+
+			if (!ok) {
+				fault();
+			}
+
+			verify_torque = !verify_torque;
+			last_verify = hrt_absolute_time();
+			continue;
+		}
+
+		if (mode == ScPosition::Center && goals[0] == dxl_rc::level_goal && goals[1] == dxl_rc::level_goal
+		    && goals[2] == dxl_rc::level_goal && now - last_center >= center_feedback_us) {
+			int32_t actual[3]{};
+
+			if (!dxl_read_checked(fd, 132, actual)) {
+				fault();
+				continue;
+			}
+
+			bool settled = true;
+
+			for (int32_t pos : actual) {
+				settled &= pos >= dxl_rc::level_goal - center_tolerance && pos <= dxl_rc::level_goal + center_tolerance;
+			}
+
+			if (settled && center_samples < 2 && ++center_samples == 2) {
+				PX4_INFO("CENTER ready: all 3 servos at level");
+			}
+
+			if (!settled) {
+				center_samples = 0;
+			}
+
+			gate.set_center_ready(center_samples == 2);
+			last_center = hrt_absolute_time();
+			continue;
+		}
+
+		if (now - last_write >= write_interval_us && (!automatic || !auto_stop.load())) {
+			const int32_t demand = mode == ScPosition::Down ? dxl_rc::wave_goal(static_cast<float>(now - wave_start) * 1e-6f)
+					       : mode == ScPosition::Up ? dxl_rc::raise_goal : dxl_rc::level_goal;
+			int32_t next_goals[3]{};
+			bool changed = false;
+
+			for (unsigned i = 0; i < 3; ++i) {
+				next_goals[i] = goals[i] + math::constrain(demand - goals[i], -max_step, max_step);
+				changed |= next_goals[i] != goals[i];
+			}
+
+			if (changed) {
+				if (!dxl_sync_write_goal(fd, next_goals)) {
+					fault();
+
+				} else {
+					memcpy(goals, next_goals, sizeof(goals));
+					last_write = hrt_absolute_time();
+				}
+			}
+		}
+	}
+
+	reset();
+	PX4_INFO("Dynamixel control stopped; torque unchanged");
+	return result;
+}
+
+static int dxl_auto_task(int, char *[])
+{
+	const int result = dxl_rc_control(true);
+	auto_running.store(false);
+	serial_busy.store(false);
+	return result;
+}
+
+static int dxl_serial_command(int argc, char *argv[])
+{
+	const char *dev = dxl_device;
+	const int baud = dxl_baud;
+
+	if (strcmp(argv[1], "rc_live") == 0) {
+		return dxl_rc_control(false);
 	}
 
 	if (strcmp(argv[1], "ping") == 0) {
@@ -485,11 +885,7 @@ extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 		}
 
 		// 1. 广播开启 3 台电机力矩 (Addr 64 = 1)
-		uint8_t tq_params[3] = {64, 0x00, 0x01};
-		uint8_t tq_tx[24]{};
-		int tq_len = dxl_build_packet(0xFE, 0x03, tq_params, sizeof(tq_params), tq_tx, sizeof(tq_tx));
-
-		if (tq_len < 0 || !dxl_write_all(fd, tq_tx, (size_t)tq_len, 50)) {
+		if (!dxl_enable_torque(fd)) {
 			PX4_ERR("开启电机力矩发送失败");
 			::close(fd);
 			return -1;
@@ -497,17 +893,7 @@ extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 
 		px4_usleep(10000); // 等待 57600 波特率下报文发完且电机完成力矩使能
 
-		// 2. Sync Write (0x83) 同步写入 3 台电机目标位置 (Addr 116, 4字节)
-		uint8_t sw_params[19] = {
-			116, 0x00, 0x04, 0x00,
-			1, (uint8_t)(pos[0] & 0xFF), (uint8_t)((pos[0] >> 8) & 0xFF), (uint8_t)((pos[0] >> 16) & 0xFF), (uint8_t)((pos[0] >> 24) & 0xFF),
-			2, (uint8_t)(pos[1] & 0xFF), (uint8_t)((pos[1] >> 8) & 0xFF), (uint8_t)((pos[1] >> 16) & 0xFF), (uint8_t)((pos[1] >> 24) & 0xFF),
-			3, (uint8_t)(pos[2] & 0xFF), (uint8_t)((pos[2] >> 8) & 0xFF), (uint8_t)((pos[2] >> 16) & 0xFF), (uint8_t)((pos[2] >> 24) & 0xFF)
-		};
-		uint8_t sw_tx[48]{};
-		int sw_len = dxl_build_packet(0xFE, 0x83, sw_params, sizeof(sw_params), sw_tx, sizeof(sw_tx));
-
-		if (sw_len < 0 || !dxl_write_all(fd, sw_tx, (size_t)sw_len, 50)) {
+		if (!dxl_sync_write_goal(fd, pos)) {
 			PX4_ERR("同步写入目标位置发送失败");
 			::close(fd);
 			return -1;
@@ -519,7 +905,7 @@ extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 		int32_t rb_pos[3]{};
 		uint8_t rb_err[3]{};
 
-		if (!dxl_sync_read_i32(fd, 116, rb_pos, rb_err, nullptr)) {
+		if (!dxl_sync_read(fd, 116, rb_pos, rb_err, nullptr)) {
 			PX4_ERR("运动指令读回校验失败: 未收齐 3 台电机响应，请检查供电与 TX/RX 接线");
 			::close(fd);
 			return -1;
@@ -549,7 +935,7 @@ extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 		int32_t cur_pos[3]{};
 		uint8_t cur_err[3]{};
 		size_t raw_bytes = 0;
-		bool ok = dxl_sync_read_i32(fd, 132, cur_pos, cur_err, &raw_bytes);
+		bool ok = dxl_sync_read(fd, 132, cur_pos, cur_err, &raw_bytes);
 
 		if (!ok) {
 			PX4_ERR("Sync Read 未收齐 3 台电机状态 (串口共收 %u 字节)", (unsigned)raw_bytes);
@@ -566,6 +952,59 @@ extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
 		return 0;
 	}
 
-	PX4_ERR("未知子命令: %s! 用法: dxl_arm [ping | move <pos1> <pos2> <pos3> | read]", argv[1]);
 	return -1;
+}
+
+extern "C" __EXPORT int dxl_arm_main(int argc, char *argv[])
+{
+	if (argc < 2) {
+		PX4_INFO("Usage: dxl_arm [start | stop | status | ping | move <p1> <p2> <p3> | read | rc_test | rc_live]");
+		return -1;
+	}
+
+	const char *cmd = argv[1];
+
+	if (strcmp(cmd, "rc_test") == 0) {
+		return dxl_rc_test();
+	}
+
+	if (strcmp(cmd, "status") == 0) {
+		PX4_INFO("Dynamixel RC auto %s", auto_running.load() ? (auto_stop.load() ? "stopping" : "running") : "stopped");
+		return 0;
+	}
+
+	if (strcmp(cmd, "stop") == 0) {
+		if (auto_running.load()) {
+			auto_stop.store(true);
+		}
+
+		return 0;
+	}
+
+	bool expected = false;
+
+	if (!serial_busy.compare_exchange(&expected, true)) {
+		PX4_ERR("Dynamixel port in use. Stop RC auto for manual bus commands.");
+		return -1;
+	}
+
+	if (strcmp(cmd, "start") == 0) {
+		auto_stop.store(false);
+		auto_running.store(true);
+		const int task = px4_task_spawn_cmd("dxl_arm_rc", SCHED_DEFAULT, SCHED_PRIORITY_SLOW_DRIVER, 3200,
+						   dxl_auto_task, nullptr);
+
+		if (task < 0) {
+			auto_running.store(false);
+			serial_busy.store(false);
+			PX4_ERR("Failed to start Dynamixel RC task: %d", task);
+			return -1;
+		}
+
+		return 0;
+	}
+
+	const int result = dxl_serial_command(argc, argv);
+	serial_busy.store(false);
+	return result;
 }
