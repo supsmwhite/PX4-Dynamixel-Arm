@@ -1,6 +1,6 @@
 # dxl_arm：CUAV 7-Nano 三舵机控制
 
-基于 PX4 官方 `release/1.18`（`8303efda43`），实现三台 DYNAMIXEL XL430-W250-T 的串口诊断、同步位置控制和遥控三档动作。串口通信、三档动作和开机自启已在台架验证；未进行飞行验证。
+基于 PX4 官方 `release/1.18`（`8303efda43`），实现三台 DYNAMIXEL XL430-W250-T 的串口诊断、同步位置控制、遥控三档动作和 uORB 关节反馈。基础串口和遥控流程已在台架验证；本版新目标与 uORB 反馈的验收步骤见下文。未进行飞行验证。
 
 ## 改动位置
 
@@ -8,6 +8,7 @@
 | --- | --- |
 | [`dxl_arm.cpp`](dxl_arm.cpp) | 打开串口，按 DYNAMIXEL Protocol 2.0 收发报文（CRC16、字节填充、超时处理）；同步写入目标、读取反馈并实现遥控后台任务 |
 | [`rc_motion.hpp`](rc_motion.hpp) | 定义三档动作、回中门槛和正弦轨迹 |
+| [`DxlJointState.msg`](../../../msg/DxlJointState.msg) | 三台舵机实际位置的 uORB 消息 |
 | [`CMakeLists.txt`](CMakeLists.txt)、[`Kconfig`](Kconfig)、[板级配置](../../../boards/cuav/7-nano/default.px4board) | 注册 `dxl_arm` 并加入 `cuav_7-nano_default` 固件 |
 | [板级启动脚本](../../../boards/cuav/7-nano/init/rc.board_extras) | 开机执行 `dxl_arm start`，无需在 MAVLink Console 手动启动 |
 
@@ -26,15 +27,15 @@ make cuav_7-nano_default
 make cuav_7-nano_default upload
 ```
 
-生成的固件位于 `build/cuav_7-nano_default/cuav_7-nano_default.px4`。拆桨、固定并支撑机构，保留可随时切断的舵机电源。上电后保持飞控未解锁，接通遥控，把 `SC` 放在中档。后台检查三台舵机的模式、限位和初始位置，需要时开启力矩。**等三台实际回到 `2000` 附近，再拨上档或下档**；快速经过中档不会放行。
+生成的固件位于 `build/cuav_7-nano_default/cuav_7-nano_default.px4`。拆桨、固定并支撑机构，保留可随时切断的舵机电源。上电后保持飞控未解锁，接通遥控，把 `SC` 放在中档。后台检查三台舵机的模式、限位和初始位置，需要时开启力矩。**等三台实际回到 `2048` 附近并提示 `CENTER ready`，再拨上档或下档**；快速经过中档不会放行。
 
 | `SC` 档位 | 三台舵机的动作 |
 | --- | --- |
-| 上 | 一次同步下发 `2800`，由舵机内部的位置控制执行 |
-| 中 | 一次同步下发 `2000`；编码器反馈确认到位后才允许切入外档 |
-| 下 | 从 `2000` 平滑接入 `1900～2500` 的正弦往复，约 7 秒一周期 |
+| 上 | 一次同步下发 `1707`，约为机构向上 `30°`（`−0.523 rad`） |
+| 中 | 一次同步下发 `2048`（`0 rad`）；实际位置确认回中后才放行外档 |
+| 下 | 从新中位平滑接入原有 `1900～2500` 正弦往复，约 7 秒一周期 |
 
-台架复验通过：切到上档时直接下发 `2800`，切回中档时直接下发 `2000`，三台舵机均按目标动作。
+新目标按三台中位均为 `2048`、计数增加为向下配置。烧录前在 Wizard 核对零位、方向和限位，确保三台均允许 `1707～2500`；若有一台不符，先不要运行遥控动作。
 
 遥控失联或飞控解锁后，后台停止下发目标；恢复后须回中才能重新进入外档。**停止下发不等于切断力矩**，舵机可能继续执行最后收到的目标。动作值按当前台架设定，换机构或舵机后应重新验证行程。
 
@@ -52,6 +53,44 @@ make cuav_7-nano_default upload
 | `dxl_arm move --timing <p1> <p2> <p3>` | 台架计时：只发一次新目标，记录目标读回与到位观测时间 |
 | `dxl_arm rc_live` | 手动启动 60 秒遥控台架测试，正常使用无需调用 |
 
+## uORB 关节反馈
+
+遥控后台正常工作时，同一任务在三档都通过 `Sync Read` 读取 `Present Position`（地址 `132`）。查询目标间隔为 `100 ms`（约 `10 Hz`），实际节奏还受串口和任务调度影响。只有三台都返回有效的单圈位置时，才发布一条 [`dxl_joint_state`](../../../msg/DxlJointState.msg)。它报告的是实际位置，不是下发的目标。
+
+| 字段 | 含义 |
+| --- | --- |
+| `raw_position[3]` | 编码器原始计数，按 ID `1、2、3` 排列。 |
+| `position_rad[3]` | 同样按 ID `1、2、3` 排列，按 `(计数 − 2048) × 2π / 4096` 换算。中位为 `0 rad`，向上为负、向下为正。 |
+| `timestamp` | 飞控收齐这组读数后的时间，自开机起算，单位为微秒。不是舵机内部采样时间，也不表示三台同步采样。 |
+
+### 上层模块订阅
+
+同一台飞控上的 PX4 模块可直接订阅这个话题，无需打开串口。下面的例子读取最近一组，并检查它是否过期；`max_age_us` 由上层根据算法周期与容许延迟决定。
+
+```cpp
+#include <drivers/drv_hrt.h>
+#include <uORB/Subscription.hpp>
+#include <uORB/topics/dxl_joint_state.h>
+
+static uORB::Subscription joint_state_sub{ORB_ID(dxl_joint_state)};
+
+bool read_joint_state(dxl_joint_state_s &state, hrt_abstime max_age_us)
+{
+    return joint_state_sub.copy(&state) && state.timestamp != 0
+           && hrt_elapsed_time(&state.timestamp) <= max_age_us;
+}
+```
+
+返回 `true` 后，可用 `state.position_rad[0]` 读取 ID 1 的角度。`copy()` 可能反复返回同一条消息；需要区分新旧两帧时，比较 `timestamp` 或使用 `update()`。后台停止、遥控失联或读回失败后，旧消息仍可能可读，不能继续把它当作实时反馈。此功能不包含向外部电脑转发 uORB 的接口。
+
+### 台架验收
+
+1. 在中档等到 `CENTER ready` 后，**保持遥控后台运行**，在 QGC 的 MAVLink Console 执行 `listener dxl_joint_state -n 3`。三条消息的 `timestamp` 应递增，三个原始读数应接近 `2048`，对应弧度接近 `0`。
+2. 拨上档并等舵机停稳，再执行同一条命令。三台应确实向上，原始读数接近 `1707`，弧度接近 `−0.523`。若有任一台方向相反或碰到限位，立即停测。
+3. 回中并再次等到 `CENTER ready`，再拨下档。执行 `listener dxl_joint_state -n 10`，原始读数和弧度应随原有正弦动作持续变化。
+
+`listener` 只显示已发布的数据，不会查询舵机。也可以先停止后台，执行 `dxl_arm read` 再用 `listener dxl_joint_state` 核对单次发布；`read --timing` 只测查询耗时，不发布话题。
+
 ## 台架计时
 
 保持飞控未解锁、拆桨并支撑机构。停止遥控后台后，按需要执行以下测试。字段定义、原始读数和统计结果见[台架延迟实测](LATENCY.md)。
@@ -62,12 +101,12 @@ make cuav_7-nano_default upload
 
 ### 动作计时
 
-先使能力矩并回中，等三台停稳并确认实际位置均在 `2000 ±15`，再发新目标：
+确认台架允许这段行程后，先使能力矩并回中，等三台停稳并确认实际位置均在 `2048 ±15`，再发新目标：
 
 ```text
-dxl_arm move 2000 2000 2000
+dxl_arm move 2048 2048 2048
 dxl_arm read
-dxl_arm move --timing 2800 2800 2800
+dxl_arm move --timing 1707 1707 1707
 ```
 
 `goal_us` 是首次读回新目标的时间；`last_out_us` 和 `first_in_us` 用于估计进入目标容差的区间；`settled_us` 是连续两次在范围内的第二次确认时间。位置轮询设定为 `10 ms`，收齐上一轮回包后才会发下一轮。比较多轮时，每轮先回中并保持负载、供电一致。

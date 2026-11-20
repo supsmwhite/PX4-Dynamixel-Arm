@@ -14,8 +14,10 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/actuator_armed.h>
+#include <uORB/topics/dxl_joint_state.h>
 #include <uORB/topics/input_rc.h>
 
 struct DxlStatusPacket {
@@ -510,6 +512,8 @@ static constexpr const char *dxl_device = "/dev/ttyS5"; // TELEM1
 static constexpr int dxl_baud = 57600;
 static constexpr unsigned ch7_index = 6;
 static constexpr hrt_abstime rc_timeout_us = 250000;
+static constexpr int32_t center_tolerance = 15;
+static uORB::Publication<dxl_joint_state_s> joint_state_pub{ORB_ID(dxl_joint_state)};
 static px4::atomic<bool> serial_busy{false};
 static px4::atomic<bool> auto_running{false};
 static px4::atomic<bool> auto_stop{false};
@@ -531,6 +535,24 @@ static bool dxl_read_checked(int fd, uint16_t addr, int32_t values[3], uint8_t w
 	}
 
 	return true;
+}
+
+static void dxl_publish_joint_state(const int32_t positions[3])
+{
+	dxl_joint_state_s state{};
+	state.timestamp = hrt_absolute_time();
+
+	for (unsigned i = 0; i < 3; ++i) {
+		// Torque-off readings can be multi-turn; don't publish them as single-turn angles.
+		if (positions[i] < 0 || positions[i] >= dxl_rc::counts_per_turn) {
+			return;
+		}
+
+		state.raw_position[i] = positions[i];
+		state.position_rad[i] = dxl_rc::position_rad(positions[i]);
+	}
+
+	joint_state_pub.publish(state);
 }
 
 static bool dxl_verify_goals(int fd, const int32_t expected[3])
@@ -645,7 +667,8 @@ static bool dxl_center_requested(uORB::Subscription &rc_sub, uORB::Subscription 
 static bool dxl_prepare_center(int fd, int32_t goals[3], uORB::Subscription &rc_sub,
 			       uORB::Subscription &armed_sub, bool automatic)
 {
-	constexpr int32_t safe_min = 1800;
+	// Allow reconnecting from the new up target, still bounded by each servo's limits.
+	constexpr int32_t safe_min = dxl_rc::raise_goal - center_tolerance;
 	constexpr int32_t safe_max = 3000;
 	int32_t mode[3]{}, upper[3]{}, lower[3]{}, torque[3]{};
 
@@ -658,7 +681,7 @@ static bool dxl_prepare_center(int fd, int32_t goals[3], uORB::Subscription &rc_
 	bool needs_torque = false;
 
 	for (unsigned i = 0; i < 3; ++i) {
-		if (mode[i] != 3 || lower[i] > dxl_rc::wave_min || upper[i] < dxl_rc::raise_goal
+		if (mode[i] != 3 || lower[i] > dxl_rc::raise_goal || upper[i] < dxl_rc::wave_max
 		    || goals[i] < math::max(safe_min, lower[i]) || goals[i] > math::min(safe_max, upper[i])
 		    || (torque[i] != 0 && torque[i] != 1)) {
 			PX4_ERR("ID %u: check position mode, limits and starting position", i + 1);
@@ -683,9 +706,8 @@ static int dxl_rc_control(bool automatic)
 	constexpr hrt_abstime settle_detent_us = 150000;
 	constexpr hrt_abstime write_interval_us = 50000;
 	constexpr hrt_abstime verify_interval_us = 500000;
-	constexpr hrt_abstime center_feedback_us = 100000;
+	constexpr hrt_abstime feedback_interval_us = 100000;
 	constexpr int32_t wave_max_step = 18;
-	constexpr int32_t center_tolerance = 15;
 	uORB::Subscription rc_sub{ORB_ID(input_rc)};
 	uORB::Subscription armed_sub{ORB_ID(actuator_armed)};
 	input_rc_s rc{};
@@ -702,7 +724,7 @@ static int dxl_rc_control(bool automatic)
 	const hrt_abstime start = hrt_absolute_time();
 	hrt_abstime last_write = start;
 	hrt_abstime last_verify = start;
-	hrt_abstime last_center = 0;
+	hrt_abstime last_feedback = 0;
 	hrt_abstime wave_start = 0;
 	int result = 0;
 
@@ -772,7 +794,6 @@ static int dxl_rc_control(bool automatic)
 		if (mode != next) {
 			mode = next;
 			center_samples = 0;
-			last_center = 0;
 			wave_start = now;
 
 			if (mode != ScPosition::Unknown) {
@@ -798,6 +819,7 @@ static int dxl_rc_control(bool automatic)
 			}
 
 			last_write = last_verify = hrt_absolute_time();
+			last_feedback = 0;
 			continue;
 		}
 
@@ -812,35 +834,6 @@ static int dxl_rc_control(bool automatic)
 
 			verify_torque = !verify_torque;
 			last_verify = hrt_absolute_time();
-			continue;
-		}
-
-		// 目标写入不等于已经回中；实际位置连续两次达标才放行外档。
-		if (mode == ScPosition::Center && goals[0] == dxl_rc::level_goal && goals[1] == dxl_rc::level_goal
-		    && goals[2] == dxl_rc::level_goal && now - last_center >= center_feedback_us) {
-			int32_t actual[3]{};
-
-			if (!dxl_read_checked(fd, 132, actual)) {
-				fault();
-				continue;
-			}
-
-			bool settled = true;
-
-			for (int32_t pos : actual) {
-				settled &= pos >= dxl_rc::level_goal - center_tolerance && pos <= dxl_rc::level_goal + center_tolerance;
-			}
-
-			if (settled && center_samples < 2 && ++center_samples == 2) {
-				PX4_INFO("CENTER ready: all 3 servos at level");
-			}
-
-			if (!settled) {
-				center_samples = 0;
-			}
-
-			gate.set_center_ready(center_samples == 2);
-			last_center = hrt_absolute_time();
 			continue;
 		}
 
@@ -866,6 +859,41 @@ static int dxl_rc_control(bool automatic)
 					memcpy(goals, next_goals, sizeof(goals));
 					last_write = hrt_absolute_time();
 				}
+
+				continue;
+			}
+		}
+
+		// Use one periodic read for all detents, after any due goal update.
+		if (last_feedback == 0 || now - last_feedback >= feedback_interval_us) {
+			int32_t actual[3]{};
+			last_feedback = now;
+
+			if (!dxl_read_checked(fd, 132, actual)) {
+				fault();
+				continue;
+			}
+
+			dxl_publish_joint_state(actual);
+
+			// Keep the two-sample center interlock on actual positions, not goal readback.
+			if (mode == ScPosition::Center && goals[0] == dxl_rc::level_goal && goals[1] == dxl_rc::level_goal
+			    && goals[2] == dxl_rc::level_goal) {
+				bool settled = true;
+
+				for (int32_t pos : actual) {
+					settled &= pos >= dxl_rc::level_goal - center_tolerance && pos <= dxl_rc::level_goal + center_tolerance;
+				}
+
+				if (settled && center_samples < 2 && ++center_samples == 2) {
+					PX4_INFO("CENTER ready: all 3 servos at level");
+				}
+
+				if (!settled) {
+					center_samples = 0;
+				}
+
+				gate.set_center_ready(center_samples == 2);
 			}
 		}
 	}
@@ -884,6 +912,7 @@ static int dxl_auto_task(int, char *[])
 }
 
 static constexpr int32_t timing_tolerance = 15;
+static constexpr int32_t timing_max_goal = 2800; // Retain the upper bound for existing bench comparisons.
 
 static bool dxl_timing_precheck(int fd, const int32_t target[3])
 {
@@ -1154,7 +1183,7 @@ static int dxl_serial_command(int argc, char *argv[])
 				return -1;
 			}
 
-			if (timing && (pos[m] < dxl_rc::wave_min || pos[m] > dxl_rc::raise_goal)) {
+			if (timing && (pos[m] < dxl_rc::raise_goal || pos[m] > timing_max_goal)) {
 				PX4_ERR("Timing target outside bench range: %ld", static_cast<long>(pos[m]));
 				return -1;
 			}
@@ -1243,6 +1272,10 @@ static int dxl_serial_command(int argc, char *argv[])
 			PX4_ERR("Sync Read 未收齐 3 台电机状态 (串口共收 %u 字节)", (unsigned)raw_bytes);
 			::close(fd);
 			return -1;
+		}
+
+		if (cur_err[0] == 0 && cur_err[1] == 0 && cur_err[2] == 0) {
+			dxl_publish_joint_state(cur_pos);
 		}
 
 		for (int m = 0; m < 3; m++) {

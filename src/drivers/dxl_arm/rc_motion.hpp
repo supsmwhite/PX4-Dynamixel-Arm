@@ -7,11 +7,18 @@ namespace dxl_rc
 {
 enum class ScPosition { Unknown, Up, Center, Down };
 
-static constexpr int32_t level_goal = 2000;
-static constexpr int32_t raise_goal = 2800;
+static constexpr int32_t counts_per_turn = 4096;
+static constexpr int32_t level_goal = counts_per_turn / 2;
+static constexpr int32_t raise_goal = (150 * counts_per_turn + 180) / 360;
 static constexpr int32_t wave_min = 1900;
 static constexpr int32_t wave_max = 2500;
 static constexpr float wave_period_s = 7.f;
+
+inline constexpr float position_rad(int32_t counts)
+{
+	// Increasing encoder counts move down; the mechanical zero is at 180 degrees.
+	return (static_cast<float>(counts) - level_goal) * (6.283185307f / counts_per_turn);
+}
 
 class CenterGate
 {
@@ -55,7 +62,7 @@ inline int32_t wave_goal(float elapsed_s)
 	constexpr float ramp_s = 0.7f;
 	constexpr float omega = 6.283185307f / wave_period_s;
 	const float start_phase = asinf(static_cast<float>(level_goal - center) / amplitude);
-	// Start at 2000 going upward; increase phase speed from zero continuously.
+	// Start at the current center toward increasing counts, ramping the phase speed from zero.
 	const float phase_time = elapsed_s < ramp_s ? elapsed_s * elapsed_s / (2.f * ramp_s) : elapsed_s - ramp_s / 2.f;
 	return center + static_cast<int32_t>(roundf(amplitude * sinf(start_phase + omega * phase_time)));
 }
